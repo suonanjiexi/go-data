@@ -74,20 +74,20 @@ COMMIT;
 
 ## 编译和运行服务器
 
-首先，您需要编译并运行Go-Data数据库服务器：
+首先，您需要编译并运行Cyber-DB数据库服务器：
 
 ```bash
 # 进入项目目录
-cd /path/to/go-data
+cd /path/to/cyber-db
 
 # 编译服务器
-go build -o godata ./cmd/godata
+go build -o cyberdb ./cmd/cyberdb
 
 # 运行服务器（使用默认配置）
-./godata
+./cyberdb
 
 # 或者指定主机、端口和数据库路径
-./godata -host 127.0.0.1 -port 3306 -db ./mydata
+./cyberdb -host 127.0.0.1 -port 3306 -db ./mydata
 ```
 
 服务器默认配置：
@@ -194,7 +194,7 @@ SELECT MAX(age), MIN(age), AVG(age) FROM users
 
 ## 测试模式
 
-使用测试模式可以快速体验Go-Data数据库的各项功能：
+使用测试模式可以快速体验Cyber-DB数据库的各项功能：
 
 ```bash
 ./client --test
