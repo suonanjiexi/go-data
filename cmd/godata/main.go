@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"syscall"
 
-	"github.com/suonanjiexi/go-data/pkg/server"
-	"github.com/suonanjiexi/go-data/pkg/storage"
+	"github.com/suonanjiexi/cyber-db/pkg/server"
+	"github.com/suonanjiexi/cyber-db/pkg/storage"
 )
 
 func main() {
@@ -40,7 +40,7 @@ func main() {
 		log.Fatalf("无法启动服务器: %v\n", err)
 	}
 
-	fmt.Printf("Go-Data 数据库服务器已启动，监听 %s:%d\n", *host, *port)
+	fmt.Printf("Cyber-DB 数据库服务器已启动，监听 %s:%d\n", *host, *port)
 	fmt.Println("按 Ctrl+C 停止服务器")
 
 	// 等待中断信号以优雅地关闭服务器

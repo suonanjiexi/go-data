@@ -1,4 +1,4 @@
-module github.com/suonanjiexi/go-data
+module github.com/suonanjiexi/cyber-db
 
 go 1.18
 

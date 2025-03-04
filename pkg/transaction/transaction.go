@@ -7,7 +7,7 @@ import (
 	"time"
 
 	// 使用模块路径
-	"github.com/suonanjiexi/go-data/pkg/storage"
+	"github.com/suonanjiexi/cyber-db/pkg/storage"
 	// 高性能LRU缓存
 	lru "github.com/hashicorp/golang-lru/v2"
 )

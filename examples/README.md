@@ -1,4 +1,4 @@
-# Go-Data 数据库使用指南
+# Cyber-DB 数据库使用指南
 
 ## 索引功能
 
@@ -15,7 +15,7 @@ CREATE UNIQUE INDEX idx_id ON users (id)
 DROP INDEX idx_city ON users
 ```
 
-索引可以显著提高查询性能，特别是在大型数据集上。Go-Data支持两种类型的索引：
+索引可以显著提高查询性能，特别是在大型数据集上。Cyber-DB支持两种类型的索引：
 - 普通索引：允许索引列有重复值
 - 唯一索引：确保索引列的值在表中是唯一的
 
@@ -23,7 +23,7 @@ DROP INDEX idx_city ON users
 
 ### 事务隔离级别
 
-Go-Data支持四种标准的事务隔离级别：
+Cyber-DB支持四种标准的事务隔离级别：
 
 1. 读未提交（Read Uncommitted）
 2. 读已提交（Read Committed）

@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/suonanjiexi/go-data/pkg/parser"
-	"github.com/suonanjiexi/go-data/pkg/storage"
-	"github.com/suonanjiexi/go-data/pkg/transaction"
+	"github.com/suonanjiexi/cyber-db/pkg/parser"
+	"github.com/suonanjiexi/cyber-db/pkg/storage"
+	"github.com/suonanjiexi/cyber-db/pkg/transaction"
 )
 
 // Server 表示数据库服务器
@@ -147,7 +147,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 	conn.SetDeadline(time.Now().Add(5 * time.Minute))
 
 	// 发送欢迎消息
-	fmt.Fprintf(conn, "Welcome to Go-Data Database (Charset: %s)\n", s.charset)
+	fmt.Fprintf(conn, "Welcome to Cyber-DB Database (Charset: %s)\n", s.charset)
 	fmt.Fprintf(conn, "Enter SQL statements or 'exit' to quit\n")
 
 	// 创建一个事务
