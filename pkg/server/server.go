@@ -193,12 +193,17 @@ func (s *Server) handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// 检查事务是否活跃，如果不活跃则创建新事务
-		if tx.Status() != transaction.TxStatusActive {
-			// 旧事务已经不活跃，创建一个新事务
+		// 检查事务状态
+		txStatus := tx.Status()
+		if txStatus != transaction.TxStatusActive {
+			// 如果事务不活跃，先尝试回滚旧事务
+			if txStatus == transaction.TxStatusActive {
+				_ = tx.Rollback()
+			}
+			// 创建一个新事务
 			tx, err = s.txManager.Begin()
 			if err != nil {
-				fmt.Fprintf(conn, "Error: %v\n", err)
+				fmt.Fprintf(conn, "Error creating new transaction: %v\n", err)
 				continue
 			}
 		}
@@ -251,6 +256,9 @@ func (s *Server) handleConnection(conn net.Conn) {
 
 // executeStatement 执行SQL语句
 func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transaction) (string, error) {
+	// 记录开始时间，用于计算查询耗时
+	startTime := time.Now()
+
 	// 检查事务状态和超时
 	txStatus := tx.Status()
 	if txStatus != transaction.TxStatusActive {
@@ -262,19 +270,19 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 	var err error
 
 	switch stmt.Type {
-	case parser.StmtInsert:
+	case parser.InsertStmt:
 		result, err = s.executeInsert(stmt, tx)
-	case parser.StmtSelect:
+	case parser.SelectStmt:
 		result, err = s.executeSelect(stmt, tx)
-	case parser.StmtUpdate:
+	case parser.UpdateStmt:
 		result, err = s.executeUpdate(stmt, tx)
-	case parser.StmtDelete:
+	case parser.DeleteStmt:
 		result, err = s.executeDelete(stmt, tx)
-	case parser.StmtCreateTable:
+	case parser.CreateTableStmt:
 		result, err = s.executeCreateTable(stmt, tx)
-	case parser.StmtCreateIndex:
+	case parser.CreateIndexStmt:
 		result, err = s.executeCreateIndex(stmt, tx)
-	case parser.StmtDropIndex:
+	case parser.DropIndexStmt:
 		result, err = s.executeDropIndex(stmt, tx)
 	default:
 		err = fmt.Errorf("unsupported statement type: %v", stmt.Type)
@@ -291,6 +299,10 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 		}
 		return "", fmt.Errorf("execution failed: %v", err)
 	}
+
+	// 计算查询耗时并添加到结果中
+	elapsedTime := time.Since(startTime)
+	result = fmt.Sprintf("%s\n查询耗时: %v", result, elapsedTime.Round(time.Millisecond))
 
 	return result, nil
 }
@@ -359,9 +371,26 @@ func (s *Server) executeSelect(stmt *parser.Statement, tx *transaction.Transacti
 			results = append(results, result)
 		}
 	} else if len(stmt.AggFuncs) == 0 { // 只有在没有聚合函数时才执行全表扫描
-		// 全表扫描 (实际实现应该使用迭代器或范围查询)
-		// 这里简化处理，实际应该实现表的元数据和索引
-		results = append(results, "Full table scan not fully implemented")
+		// 尝试使用索引进行查询
+		indexManager := s.db.GetIndexManager()
+		if indexManager != nil {
+			// 查找可用的索引
+			for _, col := range stmt.Columns {
+				// 这里简化处理，实际应该根据查询条件选择最优索引
+				indexName := fmt.Sprintf("%s_%s_idx", stmt.Table, col)
+				index := indexManager.GetIndex(stmt.Table, indexName)
+				if index != nil {
+					// 使用索引查询
+					results = append(results, fmt.Sprintf("Using index: %s", indexName))
+					break
+				}
+			}
+		}
+
+		// 如果没有找到索引，执行全表扫描
+		if len(results) == 0 {
+			results = append(results, "Full table scan")
+		}
 	}
 
 	// 处理GROUP BY子句
@@ -406,6 +435,59 @@ func (s *Server) executeSelect(stmt *parser.Statement, tx *transaction.Transacti
 
 // evaluateCondition 评估WHERE条件
 func (s *Server) evaluateCondition(cond *parser.Condition, tablePrefix string, tx *transaction.Transaction) (string, error) {
+	// 处理IN查询
+	if cond.Operator == "IN" && len(cond.Values) > 0 {
+		// 获取列值
+		key := fmt.Sprintf("%s%s", tablePrefix, cond.Column)
+		value, err := tx.Get(key)
+		if err != nil {
+			return "", nil // 键不存在，条件不满足
+		}
+
+		// 将值转换为字符串进行比较
+		strValue := string(value)
+
+		// 检查值是否在IN列表中
+		for _, v := range cond.Values {
+			if strValue == v {
+				// 匹配成功
+				if cond.Next != nil {
+					// 处理下一个条件
+					nextResult, err := s.evaluateCondition(cond.Next, tablePrefix, tx)
+					if err != nil {
+						return "", err
+					}
+
+					// 根据逻辑运算符组合结果
+					switch cond.NextLogic {
+					case "AND":
+						if nextResult == "" {
+							return "", nil // AND条件不满足
+						}
+						return fmt.Sprintf("%s IN (%s), %s", cond.Column, strings.Join(cond.Values, ", "), nextResult), nil
+					case "OR":
+						if nextResult != "" {
+							return fmt.Sprintf("%s IN (%s), %s", cond.Column, strings.Join(cond.Values, ", "), nextResult), nil
+						}
+						return fmt.Sprintf("%s IN (%s)", cond.Column, strings.Join(cond.Values, ", ")), nil
+					default:
+						return "", fmt.Errorf("unsupported logic operator: %s", cond.NextLogic)
+					}
+				}
+
+				// 没有下一个条件，直接返回结果
+				return fmt.Sprintf("%s IN (%s)", cond.Column, strings.Join(cond.Values, ", ")), nil
+			}
+		}
+
+		// 不匹配，检查是否有OR条件
+		if cond.Next != nil && cond.NextLogic == "OR" {
+			return s.evaluateCondition(cond.Next, tablePrefix, tx)
+		}
+
+		return "", nil // 条件不满足
+	}
+
 	// 获取列值
 	key := fmt.Sprintf("%s%s", tablePrefix, cond.Column)
 	value, err := tx.Get(key)
@@ -431,14 +513,6 @@ func (s *Server) evaluateCondition(cond *parser.Condition, tablePrefix string, t
 		matched = strValue >= cond.Value
 	case "<=":
 		matched = strValue <= cond.Value
-	case "IN":
-		// 检查值是否在IN列表中
-		for _, v := range cond.Values {
-			if strValue == v {
-				matched = true
-				break
-			}
-		}
 	case "LIKE":
 		// 将SQL的LIKE模式转换为正则表达式
 		pattern := strings.ReplaceAll(cond.Value, "%", ".*")

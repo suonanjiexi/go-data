@@ -283,6 +283,7 @@ func generateTxID() string {
 // Status 返回事务的当前状态
 func (tx *Transaction) Status() int {
 	tx.mutex.RLock()
+	defer tx.mutex.RUnlock()
 
 	// 只读检查事务状态
 	status := tx.status
@@ -301,7 +302,6 @@ func (tx *Transaction) Status() int {
 		return status
 	}
 
-	tx.mutex.RUnlock()
 	return status
 }
 

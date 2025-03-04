@@ -33,7 +33,7 @@ func executeSQL(conn net.Conn, serverReader *bufio.Reader, sql string) {
 // 运行SQL测试示例
 func runSQLTestExamples(conn net.Conn, serverReader *bufio.Reader) {
 	fmt.Println("\n===== 开始执行SQL测试示例 =====")
-	fmt.Println("这个示例将展示Go-Data数据库的基本功能，包括创建表、插入数据、查询、更新、删除操作以及事务和并发控制。\n")
+	fmt.Println("这个示例将展示Go-Data数据库的基本功能,包括创建表、插入数据、查询、更新、删除操作以及事务和并发控制\n")
 
 	// 1. 创建表
 	fmt.Println("1. 创建用户表和账户表")
