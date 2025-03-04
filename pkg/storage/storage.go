@@ -2,6 +2,7 @@ package storage
 
 import (
 	"bytes"
+	"compress/gzip"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -237,55 +238,47 @@ func (db *DB) Close() error {
 
 // Get 获取键对应的值
 func (db *DB) Get(key string) ([]byte, error) {
-	// 首先检查缓存
-	if db.cache != nil {
-		if value, ok := db.cache.Get(key); ok {
-			// 缓存命中，直接返回
-			result := make([]byte, len(value.([]byte)))
-			copy(result, value.([]byte))
-			return result, nil
-		}
+	// 首先检查查询缓存
+	if value, ok := db.resultCache.Get(key); ok {
+		return value, nil
 	}
 
-	// 检查预读缓存
-	if db.preReadBuffer != nil {
-		if value, ok := db.preReadBuffer.Load(key); ok {
-			// 预读缓存命中
-			result := make([]byte, len(value.([]byte)))
-			copy(result, value.([]byte))
-			// 添加到主缓存
-			if db.cache != nil {
-				db.cache.Add(key, value)
-			}
-			return result, nil
-		}
-	}
-
-	db.mutex.RLock()
-	defer db.mutex.RUnlock()
+	// 获取分片锁
+	shardID := db.getShardID(key)
+	db.shardMutexes[shardID].RLock()
+	defer db.shardMutexes[shardID].RUnlock()
 
 	if !db.isOpen {
 		return nil, ErrDBNotOpen
 	}
 
+	// 检查LRU缓存
+	if value, ok := db.cache.Get(key); ok {
+		// 将结果添加到查询缓存
+		db.resultCache.Add(key, value)
+		return value, nil
+	}
+
+	// 从数据存储中获取
 	value, ok := db.data[key]
 	if !ok {
 		return nil, ErrKeyNotFound
 	}
 
-	// 返回值的副本，避免外部修改影响内部数据
-	result := make([]byte, len(value))
-	copy(result, value)
+	// 更新缓存
+	db.cache.Add(key, value)
+	db.resultCache.Add(key, value)
 
-	// 添加到缓存
-	if db.cache != nil {
-		db.cache.Add(key, value)
+	return value, nil
+}
+
+// getShardID 计算键的分片ID
+func (db *DB) getShardID(key string) int {
+	hash := 0
+	for i := 0; i < len(key); i++ {
+		hash = 31*hash + int(key[i])
 	}
-
-	// 执行预读
-	go db.preReadNearbyKeys(key)
-
-	return result, nil
+	return (hash & 0x7FFFFFFF) % db.shardCount
 }
 
 // preReadNearbyKeys 预读取附近的键值对
@@ -355,26 +348,51 @@ func (db *DB) Put(key string, value []byte) error {
 }
 
 // flushBatch 将批量写入缓冲区的数据写入存储
+// flushBatch 执行批量写入
 func (db *DB) flushBatch() error {
-	db.mutex.Lock()
-	defer db.mutex.Unlock()
-
-	if !db.isOpen {
-		return ErrDBNotOpen
+	if len(db.batchBuffer) == 0 {
+		return nil
 	}
 
-	// 将缓冲区中的所有操作应用到数据存储
+	// 使用写缓冲区
+	db.writeBuffer.Reset()
+
+	// 压缩数据
+	var compressedWriter *gzip.Writer
+	if db.compression {
+		compressedWriter = gzip.NewWriter(db.writeBuffer)
+	}
+
+	// 批量处理写操作
 	for _, op := range db.batchBuffer {
+		// 如果启用了压缩
+		if db.compression {
+			if _, err := compressedWriter.Write(op.value); err != nil {
+				return err
+			}
+		}
+
+		// 更新内存数据
 		db.data[op.key] = op.value
 
 		// 更新缓存
-		if db.cache != nil {
-			db.cache.Add(op.key, op.value)
+		db.cache.Add(op.key, op.value)
+	}
+
+	// 如果启用了压缩，确保所有数据都被写入
+	if db.compression {
+		if err := compressedWriter.Close(); err != nil {
+			return err
 		}
 	}
 
-	// 清空缓冲区
-	db.batchBuffer = make([]writeOp, 0, db.batchSize) // 预分配容量以减少内存分配
+	// 清空批处理缓冲区
+	db.batchBuffer = db.batchBuffer[:0]
+
+	// 如果是持久化存储，写入文件
+	if db.persistent {
+		return db.persistToDisk()
+	}
 
 	return nil
 }
@@ -425,7 +443,7 @@ func (db *DB) Has(key string) (bool, error) {
 	return ok, nil
 }
 
-// GetIndexManager 获取索引管理器
+// GetIndexManager 返回数据库的索引管理器
 func (db *DB) GetIndexManager() *IndexManager {
 	return db.indexManager
 }
@@ -454,4 +472,55 @@ func (db *DB) DropIndex(table, name string) error {
 	}
 
 	return db.indexManager.DropIndex(table, name)
+}
+
+// persistToDisk 将数据持久化到磁盘
+func (db *DB) persistToDisk() error {
+	// 创建临时文件
+	tmpFile := db.path + ".tmp"
+	dir := filepath.Dir(db.path)
+
+	// 确保目录存在
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("failed to create directory: %w", err)
+	}
+
+	// 创建临时文件
+	file, err := os.Create(tmpFile)
+	if err != nil {
+		return fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer file.Close()
+
+	// 使用gob编码器
+	encoder := gob.NewEncoder(file)
+
+	// 如果启用了压缩
+	if db.compression {
+		compressedWriter := gzip.NewWriter(file)
+		defer compressedWriter.Close()
+		encoder = gob.NewEncoder(compressedWriter)
+	}
+
+	// 编码数据
+	if err := encoder.Encode(db.data); err != nil {
+		return fmt.Errorf("failed to encode database data: %w", err)
+	}
+
+	// 确保数据写入磁盘
+	if err := file.Sync(); err != nil {
+		return fmt.Errorf("failed to sync file: %w", err)
+	}
+
+	// 关闭文件
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("failed to close file: %w", err)
+	}
+
+	// 替换原文件
+	if err := os.Rename(tmpFile, db.path); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	return nil
 }

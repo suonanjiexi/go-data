@@ -27,6 +27,7 @@ type BTreeNode struct {
 	Parent     *BTreeNode   // 父节点指针，优化查找父节点的性能
 	Height     int          // 节点高度（根节点为0）
 	mutex      sync.RWMutex // 节点级别的读写锁
+	keyMutexes []sync.RWMutex // 键级别的读写锁，提供更细粒度的并发控制
 	Dirty      bool         // 标记节点是否被修改
 	CachedSum  int64        // 缓存的子节点值的总和（用于聚合查询优化）
 	LastAccess time.Time    // 最后访问时间（用于缓存管理）
@@ -64,30 +65,49 @@ func NewBTree(degree int) *BTree {
 
 	// 创建根节点
 	root := &BTreeNode{
-		IsLeaf: true,
-		Keys:   make([]string, 0),
-		Values: make([][]string, 0),
+		IsLeaf:     true,
+		Keys:       make([]string, 0),
+		Values:     make([][]string, 0),
+		keyMutexes: make([]sync.RWMutex, 0), // 初始化键级别锁数组
 	}
+
+	// 创建缓存
+	nodeCache, _ := lru.New[string, *BTreeNode](10000) // 增大缓存容量
+	
+	// 创建统计信息
+	stats := &TreeStats{}
 
 	return &BTree{
 		Root:      root,
 		Degree:    degree,
 		NodeCount: 1,
 		Height:    1,
+		NodeCache: nodeCache,
+		Stats:     stats,
 	}
 }
 
 // Insert 插入键值对
 func (bt *BTree) Insert(key string, recordID string, unique bool) error {
-	bt.mutex.Lock()
-	defer bt.mutex.Unlock()
+	// 更新统计信息
+	if bt.Stats != nil {
+		bt.Stats.mutex.Lock()
+		bt.Stats.Inserts++
+		bt.Stats.mutex.Unlock()
+	}
 
+	bt.mutex.RLock() // 使用读锁而不是写锁，提高并发性
 	// 查找合适的叶子节点
 	leaf := bt.findLeaf(key)
+	bt.mutex.RUnlock()
 
 	// 在叶子节点中查找位置
 	leaf.mutex.Lock()
-	defer leaf.mutex.Unlock()
+
+	// 确保keyMutexes数组与Keys数组长度一致
+	for len(leaf.keyMutexes) < len(leaf.Keys) {
+		leaf.keyMutexes = append(leaf.keyMutexes, sync.RWMutex{})
+	}
 
 	pos := 0
 	for pos < len(leaf.Keys) && leaf.Keys[pos] < key {
@@ -96,6 +116,11 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 
 	// 检查是否已存在相同的键
 	if pos < len(leaf.Keys) && leaf.Keys[pos] == key {
+		// 获取特定键的锁
+		leaf.keyMutexes[pos].Lock()
+		leaf.mutex.Unlock() // 释放节点锁，允许其他键的操作继续
+		defer leaf.keyMutexes[pos].Unlock()
+
 		// 如果是唯一索引，返回错误
 		if unique {
 			return fmt.Errorf("unique index violation: key '%s' already exists", key)
@@ -105,14 +130,19 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 		return nil
 	}
 
+	// 需要修改节点结构，保持节点锁
+	defer leaf.mutex.Unlock()
+
 	// 插入新键值对
 	leaf.Keys = append(leaf.Keys, "")
 	leaf.Values = append(leaf.Values, nil)
+	leaf.keyMutexes = append(leaf.keyMutexes, sync.RWMutex{})
 
 	// 移动元素，为新键值对腾出位置
 	if pos < len(leaf.Keys)-1 {
 		copy(leaf.Keys[pos+1:], leaf.Keys[pos:len(leaf.Keys)-1])
 		copy(leaf.Values[pos+1:], leaf.Values[pos:len(leaf.Values)-1])
+		// 不需要移动互斥锁，它们是值类型
 	}
 
 	// 插入新键值对
@@ -121,7 +151,10 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 
 	// 检查是否需要分裂
 	if len(leaf.Keys) > 2*bt.Degree {
+		// 需要获取树锁进行分裂操作
+		bt.mutex.Lock()
 		bt.splitLeaf(leaf)
+		bt.mutex.Unlock()
 	}
 
 	return nil
@@ -322,6 +355,9 @@ func (bt *BTree) RangeSearch(startKey, endKey string) (*QueryResult, error) {
 
 // findLeaf 查找键所在的叶子节点
 func (bt *BTree) findLeaf(key string) *BTreeNode {
+	// 记录开始时间，用于性能统计
+	start := time.Now()
+
 	// 检查节点缓存
 	if bt.NodeCache != nil {
 		cacheKey := "node:" + key
@@ -337,17 +373,24 @@ func (bt *BTree) findLeaf(key string) *BTreeNode {
 	}
 
 	node := bt.Root
+	var path []*BTreeNode // 记录查找路径，用于预取和缓存
+
 	for !node.IsLeaf {
 		// 获取节点级读锁
 		node.mutex.RLock()
+		
+		// 记录路径
+		path = append(path, node)
 
-		// 二分查找优化
-		l, r := 0, len(node.Keys)-1
+		// 优化的二分查找
+		keysLen := len(node.Keys)
 		pos := 0
 
-		if len(node.Keys) > 8 { // 只有当键数量足够多时才使用二分查找
+		if keysLen > 8 { // 只有当键数量足够多时才使用二分查找
+			// 使用更高效的二分查找
+			l, r := 0, keysLen-1
 			for l <= r {
-				mid := (l + r) / 2
+				mid := l + (r-l)/2 // 避免整数溢出
 				if node.Keys[mid] <= key {
 					pos = mid + 1
 					l = mid + 1
@@ -357,21 +400,54 @@ func (bt *BTree) findLeaf(key string) *BTreeNode {
 			}
 		} else {
 			// 对于小节点，线性查找更快
-			for pos < len(node.Keys) && key >= node.Keys[pos] {
+			for pos < keysLen && key >= node.Keys[pos] {
 				pos++
 			}
 		}
 
 		// 获取下一个节点
 		nextNode := node.Children[pos]
+		
+		// 预取相邻节点（如果可能是下一个查询目标）
+		if bt.NodeCache != nil && pos+1 < len(node.Children) {
+			go func(prefetchNode *BTreeNode) {
+				prefetchCacheKey := fmt.Sprintf("node:%p", prefetchNode)
+				bt.NodeCache.Add(prefetchCacheKey, prefetchNode)
+			}(node.Children[pos+1])
+		}
+		
 		node.mutex.RUnlock()
 		node = nextNode
 	}
 
-	// 缓存叶子节点
+	// 缓存叶子节点和路径上的节点
 	if bt.NodeCache != nil {
+		// 缓存叶子节点
 		cacheKey := "node:" + key
 		bt.NodeCache.Add(cacheKey, node)
+		
+		// 缓存路径上的节点，使用节点指针作为部分键
+		for i, pathNode := range path {
+			pathCacheKey := fmt.Sprintf("path:%s:%d", key, i)
+			bt.NodeCache.Add(pathCacheKey, pathNode)
+		}
+	}
+
+	// 更新统计信息
+	if bt.Stats != nil {
+		elapsed := time.Since(start)
+		bt.Stats.mutex.Lock()
+		// 更新查询性能统计
+		bt.Stats.AvgSearchTime = (bt.Stats.AvgSearchTime*float64(bt.Stats.Queries) + elapsed.Seconds()) / float64(bt.Stats.Queries+1)
+		// 记录最大查找时间
+		if elapsed.Seconds() > bt.Stats.MaxSearchTime {
+			bt.Stats.MaxSearchTime = elapsed.Seconds()
+		}
+		// 记录最小查找时间
+		if bt.Stats.MinSearchTime == 0 || elapsed.Seconds() < bt.Stats.MinSearchTime {
+			bt.Stats.MinSearchTime = elapsed.Seconds()
+		}
+		bt.Stats.mutex.Unlock()
 	}
 
 	return node

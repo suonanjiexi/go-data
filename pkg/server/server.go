@@ -196,10 +196,8 @@ func (s *Server) handleConnection(conn net.Conn) {
 		// 检查事务状态
 		txStatus := tx.Status()
 		if txStatus != transaction.TxStatusActive {
-			// 如果事务不活跃，先尝试回滚旧事务
-			if txStatus == transaction.TxStatusActive {
-				_ = tx.Rollback()
-			}
+			// 如果事务不活跃，尝试回滚旧事务
+			_ = tx.Rollback()
 			// 创建一个新事务
 			tx, err = s.txManager.Begin()
 			if err != nil {
@@ -286,6 +284,12 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 		result, err = s.executeDropIndex(stmt, tx)
 	default:
 		err = fmt.Errorf("unsupported statement type: %v", stmt.Type)
+	}
+
+	// 再次检查事务状态，确保事务在执行过程中没有超时
+	txStatus = tx.Status()
+	if txStatus != transaction.TxStatusActive {
+		return "", fmt.Errorf("transaction became inactive during execution")
 	}
 
 	// 处理执行错误
@@ -378,8 +382,8 @@ func (s *Server) executeSelect(stmt *parser.Statement, tx *transaction.Transacti
 			for _, col := range stmt.Columns {
 				// 这里简化处理，实际应该根据查询条件选择最优索引
 				indexName := fmt.Sprintf("%s_%s_idx", stmt.Table, col)
-				index := indexManager.GetIndex(stmt.Table, indexName)
-				if index != nil {
+				index, err := indexManager.GetIndex(stmt.Table, indexName)
+				if index != nil || err == nil {
 					// 使用索引查询
 					results = append(results, fmt.Sprintf("Using index: %s", indexName))
 					break

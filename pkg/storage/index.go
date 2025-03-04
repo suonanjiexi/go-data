@@ -216,6 +216,20 @@ func (idx *Index) findLeaf(key string) *BPlusTreeNode {
 	// 记录开始时间，用于统计
 	startTime := time.Now()
 
+	// 检查节点缓存
+	if idx.NodeCache != nil {
+		cacheKey := "leaf:" + key
+		if cachedNode, ok := idx.NodeCache.Get(cacheKey); ok {
+			// 缓存命中
+			if idx.Stats != nil {
+				idx.Stats.Mutex.Lock()
+				idx.Stats.CacheHits++
+				idx.Stats.Mutex.Unlock()
+			}
+			return cachedNode.(*BPlusTreeNode)
+		}
+	}
+
 	// 如果有统计信息，增加查找计数
 	if idx.Stats != nil {
 		idx.Stats.Mutex.Lock()
@@ -224,19 +238,25 @@ func (idx *Index) findLeaf(key string) *BPlusTreeNode {
 	}
 
 	node := idx.Root
+	var path []*BPlusTreeNode // 记录查找路径，用于预取和缓存
 
 	// 使用二分查找优化查找过程
 	for !node.IsLeaf {
 		// 获取节点级读锁
 		node.Mutex.RLock()
+		
+		// 记录路径
+		path = append(path, node)
 
-		// 二分查找优化
-		l, r := 0, len(node.Keys)-1
+		// 优化的二分查找
+		keysLen := len(node.Keys)
 		i := 0
 
-		if len(node.Keys) > 8 { // 只有当键数量足够多时才使用二分查找
+		if keysLen > 8 { // 只有当键数量足够多时才使用二分查找
+			// 使用更高效的二分查找
+			l, r := 0, keysLen-1
 			for l <= r {
-				mid := (l + r) / 2
+				mid := l + (r-l)/2 // 避免整数溢出
 				if node.Keys[mid] <= key {
 					i = mid + 1
 					l = mid + 1
@@ -245,16 +265,38 @@ func (idx *Index) findLeaf(key string) *BPlusTreeNode {
 				}
 			}
 		} else {
-			// 对于小节点，线性查找更快
-			for i < len(node.Keys) && key >= node.Keys[i] {
+			// 对于小节点，使用优化的线性查找
+			for i < keysLen && key >= node.Keys[i] {
 				i++
 			}
 		}
 
 		// 获取下一个节点
 		nextNode := node.Children[i]
+		
+		// 预取相邻节点（如果可能是下一个查询目标）
+		if idx.NodeCache != nil && i+1 < len(node.Children) {
+			go func(prefetchNode *BPlusTreeNode) {
+				prefetchCacheKey := fmt.Sprintf("node:%p", prefetchNode)
+				idx.NodeCache.Add(prefetchCacheKey, prefetchNode)
+			}(node.Children[i+1])
+		}
+		
 		node.Mutex.RUnlock()
 		node = nextNode
+	}
+
+	// 缓存叶子节点和路径上的节点
+	if idx.NodeCache != nil {
+		// 缓存叶子节点
+		cacheKey := "leaf:" + key
+		idx.NodeCache.Add(cacheKey, node)
+		
+		// 缓存路径上的节点，使用节点指针作为部分键
+		for i, pathNode := range path {
+			pathCacheKey := fmt.Sprintf("path:%s:%d", key, i)
+			idx.NodeCache.Add(pathCacheKey, pathNode)
+		}
 	}
 
 	// 更新统计信息
@@ -262,7 +304,15 @@ func (idx *Index) findLeaf(key string) *BPlusTreeNode {
 		elapsed := time.Since(startTime)
 		idx.Stats.Mutex.Lock()
 		// 更新平均查找时间
-		idx.Stats.AvgLookupTime = time.Duration((int64(idx.Stats.AvgLookupTime)*idx.Stats.Lookups + int64(elapsed)) / (idx.Stats.Lookups + 1))
+		idx.Stats.AvgLookupTime = time.Duration((int64(idx.Stats.AvgLookupTime)*int64(idx.Stats.Lookups) + int64(elapsed)) / int64(idx.Stats.Lookups+1))
+		// 记录最大查找时间
+		if elapsed > idx.Stats.MaxLookupTime {
+			idx.Stats.MaxLookupTime = elapsed
+		}
+		// 记录最小查找时间
+		if idx.Stats.MinLookupTime == 0 || elapsed < idx.Stats.MinLookupTime {
+			idx.Stats.MinLookupTime = elapsed
+		}
 		idx.Stats.Mutex.Unlock()
 	}
 
@@ -271,33 +321,62 @@ func (idx *Index) findLeaf(key string) *BPlusTreeNode {
 
 // splitIfNeeded 在必要时分裂节点
 func (idx *Index) splitIfNeeded(node *BPlusTreeNode) error {
-	if len(node.Keys) <= 2*idx.Degree {
-		return nil
-	}
-
-	// 分裂节点的逻辑
-	midIndex := len(node.Keys) / 2
-	newNode := &BPlusTreeNode{
-		IsLeaf: node.IsLeaf,
-		Keys:   make([]string, len(node.Keys)-midIndex),
-		Values: make([][]string, len(node.Values)-midIndex),
-	}
-
-	copy(newNode.Keys, node.Keys[midIndex:])
-	copy(newNode.Values, node.Values[midIndex:])
-
-	// 更新原节点
-	node.Keys = node.Keys[:midIndex]
-	node.Values = node.Values[:midIndex]
-
-	// 维护叶子节点链表
-	if node.IsLeaf {
-		newNode.Next = node.Next
-		node.Next = newNode
-	}
-
-	// 更新父节点
-	return idx.updateParent(node, newNode, newNode.Keys[0])
+    // 检查是否需要分裂
+    if len(node.Keys) <= 2*idx.Degree {
+        return nil
+    }
+    
+    // 获取节点锁，确保分裂操作的原子性
+    node.Mutex.Lock()
+    defer node.Mutex.Unlock()
+    
+    // 再次检查是否需要分裂（可能在获取锁的过程中已经被其他线程分裂）
+    if len(node.Keys) <= 2*idx.Degree {
+        return nil
+    }
+    
+    // 更新统计信息
+    if idx.Stats != nil {
+        idx.Stats.Mutex.Lock()
+        idx.Stats.Splits++
+        idx.Stats.Mutex.Unlock()
+    }
+    
+    // 分裂节点的逻辑
+    midIndex := len(node.Keys) / 2
+    newNode := &BPlusTreeNode{
+        IsLeaf: node.IsLeaf,
+        Keys:   make([]string, len(node.Keys)-midIndex),
+        Values: make([][]string, len(node.Values)-midIndex),
+        Height: node.Height,
+        Dirty:  true,
+    }
+    
+    copy(newNode.Keys, node.Keys[midIndex:])
+    copy(newNode.Values, node.Values[midIndex:])
+    
+    // 更新原节点
+    node.Keys = node.Keys[:midIndex]
+    node.Values = node.Values[:midIndex]
+    node.Dirty = true
+    
+    // 维护叶子节点链表
+    if node.IsLeaf {
+        newNode.Next = node.Next
+        if newNode.Next != nil {
+            newNode.Next.Prev = newNode
+        }
+        node.Next = newNode
+        newNode.Prev = node
+    } else {
+        // 对于非叶子节点，需要更新子节点的父指针
+        for _, child := range newNode.Children {
+            child.Parent = newNode
+        }
+    }
+    
+    // 更新父节点
+    return idx.updateParent(node, newNode, newNode.Keys[0])
 }
 
 // updateParent 更新父节点
@@ -345,16 +424,19 @@ func (idx *Index) updateParent(node, newNode *BPlusTreeNode, key string) error {
 }
 
 // Lookup 使用索引查找记录
-func (idx *Index) Lookup(key string) ([]string, error) {
-	idx.mutex.RLock()
-	defer idx.mutex.RUnlock()
-
-	if idx.Config.Type == BPlusTreeIndex {
-		return idx.lookupInBPlusTree(key)
-	}
-
-	// 其他索引类型的处理...
-	return nil, nil
+func (idx *Index) Lookup(key string) ([]string, time.Duration, error) {
+    startTime := time.Now()
+    
+    idx.mutex.RLock()
+    defer idx.mutex.RUnlock()
+    
+    if idx.Config.Type == BPlusTreeIndex {
+        result, err := idx.lookupInBPlusTree(key)
+        return result, time.Since(startTime), err
+    }
+    
+    // 其他索引类型的处理...
+    return nil, time.Since(startTime), nil
 }
 
 // lookupInBPlusTree 在B+树中查找记录
@@ -376,36 +458,170 @@ func (idx *Index) lookupInBPlusTree(key string) ([]string, error) {
 }
 
 // RangeLookup 使用索引进行范围查找
-func (idx *Index) RangeLookup(start, end string) ([]string, error) {
-	idx.mutex.RLock()
-	defer idx.mutex.RUnlock()
-
-	if idx.Config.Type != BPlusTreeIndex {
-		return nil, fmt.Errorf("range lookup only supported for B+ tree indexes")
-	}
-
-	if idx.Root == nil {
-		return []string{}, nil
-	}
-
-	// 找到起始叶子节点
-	node := idx.findLeaf(start)
-	result := []string{}
-
-	// 遍历叶子节点链表
-	for node != nil {
-		for i, key := range node.Keys {
-			if (start == "" || key >= start) && (end == "" || key <= end) {
-				result = append(result, node.Values[i]...)
-			}
-			if end != "" && key > end {
-				return result, nil
-			}
-		}
-		node = node.Next
-	}
-
-	return result, nil
+func (idx *Index) RangeLookup(start, end string) ([]string, time.Duration, error) {
+    startTime := time.Now()
+    
+    // RangeLookup 使用索引进行范围查找
+    func (idx *Index) RangeLookup(start, end ) ([]string, time.Duration, error) {
+        startTime := time.Now()
+        
+        // 使用读锁，允许并发读取
+        idx.mutex.RLock()
+        defer idx.mutex.RUnlock()
+        
+        // 更新统计信息
+        if idx.Stats != nil {
+            idx.Stats.Mutex.Lock()
+            idx.Stats.RangeLookups++
+            idx.Stats.Mutex.Unlock()
+        }
+        
+        if idx.Root == nil {
+            return []string{}, time.Since(startTime), nil
+        }
+        
+        // 预分配结果切片，减少内存分配
+        result := make([]string, 0, 1000)
+        
+        // 使用并发处理大范围查询
+        if end != "" && end > start && idx.Size > 10000 {
+            return idx.concurrentRangeLookup(start, end, startTime)
+        }
+        
+        node := idx.findLeaf(start)
+        for node != nil {
+            node.Mutex.RLock()
+            
+            // 使用二分查找优化
+            startIdx := sort.SearchStrings(node.Keys, start)
+            
+            for i := startIdx; i < len(node.Keys); i++ {
+                if end != "" && node.Keys[i] > end {
+                    node.Mutex.RUnlock()
+                    return result, time.Since(startTime), nil
+                }
+                result = append(result, node.Values[i]...)
+            }
+            
+            nextNode := node.Next
+            node.Mutex.RUnlock()
+            node = nextNode
+        }
+        
+        return result, time.Since(startTime), nil
+    }
+    
+    // concurrentRangeLookup 并发范围查找
+    func (idx *Index) concurrentRangeLookup(start, end string, startTime time.Time) ([]string, time.Duration, error) {
+        // 找到起始和结束节点
+        startNode := idx.findLeaf(start)
+        endNode := idx.findLeaf(end)
+        
+        // 计算需要处理的节点数量
+        nodeCount := 0
+        for node := startNode; node != nil && node != endNode.Next; node = node.Next {
+            nodeCount++
+        }
+        
+        // 创建工作池
+        workers := runtime.NumCPU()
+        if workers > nodeCount {
+            workers = nodeCount
+        }
+        
+        resultChan := make(chan []string, workers)
+        errChan := make(chan error, workers)
+        var wg sync.WaitGroup
+        
+        // 将节点分配给工作协程
+        nodesPerWorker := nodeCount / workers
+        currentNode := startNode
+        
+        for i := 0; i < workers; i++ {
+            wg.Add(1)
+            go func(node *BPlusTreeNode, isFirst, isLast bool) {
+                defer wg.Done()
+                localResult := make([]string, 0, 1000)
+                
+                for n := node; n != nil; n = n.Next {
+                    n.Mutex.RLock()
+                    for j, key := range n.Keys {
+                        if isFirst && key < start {
+                            continue
+                        }
+                        if isLast && key > end {
+                            n.Mutex.RUnlock()
+                            resultChan <- localResult
+                            return
+                        }
+                        localResult = append(localResult, n.Values[j]...)
+                    }
+                    n.Mutex.RUnlock()
+                }
+                resultChan <- localResult
+            }(currentNode, i == 0, i == workers-1)
+            
+            // 移动到下一组节点
+            for j := 0; j < nodesPerWorker && currentNode != nil; j++ {
+                currentNode = currentNode.Next
+            }
+        }
+        
+        // 等待所有工作协程完成
+        go func() {
+            wg.Wait()
+            close(resultChan)
+            close(errChan)
+        }()
+        
+        // 收集结果
+        var result []string
+        for r := range resultChan {
+            result = append(result, r...)
+        }
+        
+        // 检查错误
+        for err := range errChan {
+            if err != nil {
+                return nil, time.Since(startTime), err
+            }
+        }
+        
+        return result, time.Since(startTime), nil
+    }
+    
+    if idx.Config.Type != BPlusTreeIndex {
+        return nil, time.Since(startTime), fmt.Errorf("range lookup only supported for B+ tree indexes")
+    }
+    
+    if idx.Root == nil {
+        return []string{}, time.Since(startTime), nil
+    }
+    
+    // 找到起始叶子节点
+    node := idx.findLeaf(start)
+    result := []string{}
+    
+    // 遍历叶子节点链表
+    for node != nil {
+        node.Mutex.RLock()
+        
+        for i, key := range node.Keys {
+            if (start == "" || key >= start) && (end == "" || key <= end) {
+                result = append(result, node.Values[i]...)
+            }
+            if end != "" && key > end {
+                node.Mutex.RUnlock()
+                return result, time.Since(startTime), nil
+            }
+        }
+        
+        nextNode := node.Next
+        node.Mutex.RUnlock()
+        node = nextNode
+    }
+    
+    return result, time.Since(startTime), nil
 }
 
 // findParent 查找节点的父节点

@@ -8,6 +8,96 @@ import (
 	"time"
 )
 
+// ShardStatus 分片状态
+const (
+	ShardStatusNormal    = "normal"
+	ShardStatusRebalancing = "rebalancing"
+	ShardStatusMigrating = "migrating"
+)
+
+// Shard 表示一个数据分片
+type Shard struct {
+	ID          int       // 分片ID
+	Status      string    // 分片状态
+	PrimaryNode string    // 主节点ID
+	ReplicaNodes []string // 副本节点ID列表
+	KeyRange    [2]string // 键范围
+	CreateTime  time.Time // 创建时间
+	UpdateTime  time.Time // 更新时间
+	Size        int64     // 分片大小（字节）
+	RecordCount int64     // 记录数量
+}
+
+// ShardManager 分片管理器
+type ShardManager struct {
+	shards       map[int]*Shard
+	nodeShards   map[string][]int // 节点到分片的映射
+	mutex        sync.RWMutex
+	hashFunction func(key string) int // 哈希函数
+	shardCount   int                  // 分片总数
+	replicaCount int                  // 副本数量
+}
+
+// NewShardManager 创建新的分片管理器
+func NewShardManager(shardCount, replicaCount int) *ShardManager {
+	sm := &ShardManager{
+		shards:       make(map[int]*Shard),
+		nodeShards:   make(map[string][]int),
+		shardCount:   shardCount,
+		replicaCount: replicaCount,
+		hashFunction: defaultHashFunction,
+	}
+
+	return sm
+}
+
+// defaultHashFunction 默认哈希函数
+func defaultHashFunction(key string) int {
+	h := fnv.New32a()
+	h.Write([]byte(key))
+	return int(h.Sum32())
+}
+
+// InitShards 初始化分片
+func (sm *ShardManager) InitShards(nodes []string) error {
+	sm.mutex.Lock()
+	defer sm.mutex.Unlock()
+
+	if len(nodes) == 0 {
+		return fmt.Errorf("no nodes available for sharding")
+	}
+
+	// 清空现有分片
+	sm.shards = make(map[int]*Shard)
+	sm.nodeShards = make(map[string][]int)
+
+	// 初始化每个节点的分片列表
+	for _, nodeID := range nodes {
+		sm.nodeShards[nodeID] = make([]int, 0)
+	}
+
+	// 创建分片并分配给节点
+	for i := 0; i < sm.shardCount; i++ {
+		// 选择主节点（简单轮询）
+		primaryNode := nodes[i%len(nodes)]
+		
+		// 选择副本节点
+		replicaNodes := make([]string, 0, sm.replicaCount)
+		for j := 1; j <= sm.replicaCount; j++ {
+			if len(nodes) > 1 {
+				replicaNodeIndex := (i + j) % len(nodes)
+				if nodes[replicaNodeIndex] != primaryNode {
+					replicaNodes = append(replicaNodes, nodes[replicaNodeIndex])
+				}
+			}
+		}
+
+		//
+	}
+
+	return nil
+}
+
 // ShardState 定义分片状态
 type ShardState int
 
