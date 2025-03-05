@@ -24,7 +24,7 @@ func (idx *Index) RangeLookup(start, end string) ([]string, time.Duration, error
 	}
 	
 	if idx.Config.Type != BPlusTreeIndex {
-		return nil, time.Since(startTime), fmt.Errorf("range lookup only supported for B+ tree indexes")
+		return nil, time.Since(startTime), fmt.Errorf("范围查询仅支持B+树索引")
 	}
 	
 	if idx.Root == nil {

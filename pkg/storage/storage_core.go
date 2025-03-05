@@ -275,39 +275,42 @@ func (db *DB) preReadNearbyKeys(key string) {
 
 // Put 存储键值对
 func (db *DB) Put(key string, value []byte) error {
-	startTime := time.Now()
-	
-	// 验证字符串是否为有效的UTF-8MB4编码
-	if !utf8.Valid(value) {
-		return errors.New("invalid UTF-8 encoding")
-	}
+    startTime := time.Now()
+    
+    // 验证字符串是否为有效的UTF-8MB4编码
+    if !utf8.Valid(value) {
+        return errors.New("invalid UTF-8 encoding")
+    }
 
-	// 使用批量写入缓冲区
-	db.batchMutex.Lock()
-	defer db.batchMutex.Unlock()
+    // 使用批量写入缓冲区
+    db.batchMutex.Lock()
+    defer db.batchMutex.Unlock()
 
-	if !db.isOpen {
-		return ErrDBNotOpen
-	}
+    if !db.isOpen {
+        return ErrDBNotOpen
+    }
 
-	// 存储值的副本，避免外部修改影响内部数据
-	valueCopy := make([]byte, len(value))
-	copy(valueCopy, value)
+    // 存储值的副本，避免外部修改影响内部数据
+    valueCopy := make([]byte, len(value))
+    copy(valueCopy, value)
 
-	// 添加到批量写入缓冲区
-	db.batchBuffer = append(db.batchBuffer, writeOp{key: key, value: valueCopy})
+    // 添加到批量写入缓冲区
+    db.batchBuffer = append(db.batchBuffer, writeOp{key: key, value: valueCopy})
+    
+    // 更新修改时间
+    db.modificationTimes[key] = time.Now()
 
-	// 更新统计信息
-	db.putOps++
-	elapsed := time.Since(startTime)
-	db.avgPutTime = time.Duration((int64(db.avgPutTime)*int64(db.putOps-1) + int64(elapsed)) / int64(db.putOps))
+    // 更新统计信息
+    db.putOps++
+    elapsed := time.Since(startTime)
+    db.avgPutTime = time.Duration((int64(db.avgPutTime)*int64(db.putOps-1) + int64(elapsed)) / int64(db.putOps))
 
-	// 如果缓冲区达到批量写入大小，执行批量写入
-	if len(db.batchBuffer) >= db.batchSize {
-		return db.flushBatch()
-	}
+    // 如果缓冲区达到批量写入大小，执行批量写入
+    if len(db.batchBuffer) >= db.batchSize {
+        return db.flushBatch()
+    }
 
-	return nil
+    return nil
 }
 
 // Delete 删除键值对

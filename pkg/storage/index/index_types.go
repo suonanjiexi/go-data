@@ -60,19 +60,125 @@ type Index struct {
 }
 
 // IndexStats 索引统计信息
+// 扩展 IndexStats 结构体
 type IndexStats struct {
-	Lookups       int64         // 查找操作次数
-	RangeLookups  int64         // 范围查找操作次数
-	Inserts       int64         // 插入操作次数
-	Deletes       int64         // 删除操作次数
-	Splits        int64         // 节点分裂次数
-	Merges        int64         // 节点合并次数
-	CacheHits     int64         // 缓存命中次数
-	CacheMisses   int64         // 缓存未命中次数
-	AvgLookupTime time.Duration // 平均查找时间
-	MaxLookupTime time.Duration // 最大查找时间
-	MinLookupTime time.Duration // 最小查找时间
-	Mutex         sync.Mutex    // 统计信息锁
+    Lookups            int64         // 查找操作次数
+    RangeLookups       int64         // 范围查找操作次数
+    Inserts            int64         // 插入操作次数
+    Deletes            int64         // 删除操作次数
+    Splits             int64         // 节点分裂次数
+    Merges             int64         // 节点合并次数
+    CacheHits          int64         // 缓存命中次数
+    CacheMisses        int64         // 缓存未命中次数
+    AvgLookupTime      time.Duration // 平均查找时间
+    MaxLookupTime      time.Duration // 最大查找时间
+    MinLookupTime      time.Duration // 最小查找时间
+    AvgInsertTime      time.Duration // 平均插入时间
+    MaxInsertTime      time.Duration // 最大插入时间
+    MinInsertTime      time.Duration // 最小插入时间
+    AvgRangeLookupTime time.Duration // 平均范围查找时间
+    MaxRangeLookupTime time.Duration // 最大范围查找时间
+    AvgRangeSize       int           // 平均范围大小
+    Resizes            int64         // 哈希表调整大小次数
+    LastResizeTime     time.Duration // 最后一次调整大小耗时
+    AvgBucketSize      float64       // 平均桶大小
+    MaxBucketSize      int           // 最大桶大小
+    EmptyBuckets       int           // 空桶数量
+    BucketStdDev       float64       // 桶大小标准差
+    Mutex              sync.Mutex    // 统计信息锁
+}
+
+// IndexMonitor 索引监控器
+type IndexMonitor struct {
+    manager         *IndexManager
+    monitorInterval time.Duration
+    stopCh          chan struct{}
+}
+
+// NewIndexMonitor 创建新的索引监控器
+func NewIndexMonitor(manager *IndexManager) *IndexMonitor {
+    return &IndexMonitor{
+        manager:         manager,
+        monitorInterval: 10 * time.Minute,
+        stopCh:          make(chan struct{}),
+    }
+}
+
+// Start 启动索引监控
+func (im *IndexMonitor) Start() {
+    go im.monitorRoutine()
+    log.Println("索引监控器已启动")
+}
+
+// Stop 停止索引监控
+func (im *IndexMonitor) Stop() {
+    close(im.stopCh)
+    log.Println("索引监控器已停止")
+}
+
+// monitorRoutine 监控例程
+func (im *IndexMonitor) monitorRoutine() {
+    ticker := time.NewTicker(im.monitorInterval)
+    defer ticker.Stop()
+    
+    for {
+        select {
+        case <-ticker.C:
+            im.collectStats()
+            im.optimizeIndexes()
+        case <-im.stopCh:
+            return
+        }
+    }
+}
+
+// collectStats 收集索引统计信息
+func (im *IndexMonitor) collectStats() {
+    // 获取所有索引
+    indexes := im.manager.GetAllIndexes()
+    
+    for _, index := range indexes {
+        if index.Stats == nil {
+            continue
+        }
+        
+        // 收集统计信息
+        index.Stats.Mutex.Lock()
+        stats := *index.Stats // 复制统计信息
+        index.Stats.Mutex.Unlock()
+        
+        // 记录统计信息
+        log.Printf("索引 %s.%s 统计: 查询=%d, 插入=%d, 删除=%d, 平均查询时间=%v",
+            index.Config.Table, index.Config.Name,
+            stats.Lookups, stats.Inserts, stats.Deletes,
+            stats.AvgLookupTime)
+    }
+}
+
+// optimizeIndexes 优化索引
+func (im *IndexMonitor) optimizeIndexes() {
+    // 获取所有索引
+    indexes := im.manager.GetAllIndexes()
+    
+    for _, index := range indexes {
+        // 检查索引是否需要优化
+        if index.needsOptimization() {
+            log.Printf("开始优化索引 %s.%s", index.Config.Table, index.Config.Name)
+            
+            // 根据索引类型执行不同的优化
+            switch index.Config.Type {
+            case BPlusTreeIndex:
+                index.optimizeBPlusTree()
+            case HashIndex:
+                if hashIndex, ok := index.HashIndex.(*HashIndex); ok {
+                    hashIndex.optimizeBuckets()
+                }
+            }
+        }
+    }
+}
+
+Mutex         sync.Mutex    // 统计信息锁
 }
 
 // IndexManager 管理数据库中的所有索引

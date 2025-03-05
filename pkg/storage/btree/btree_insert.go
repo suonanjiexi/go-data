@@ -21,6 +21,7 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 
 	// 在叶子节点中查找位置
 	leaf.mutex.Lock()
+	defer leaf.mutex.Unlock()
 
 	// 确保keyMutexes数组与Keys数组长度一致
 	for len(leaf.keyMutexes) < len(leaf.Keys) {
@@ -34,22 +35,23 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 
 	// 检查是否已存在相同的键
 	if pos < len(leaf.Keys) && leaf.Keys[pos] == key {
-		// 获取特定键的锁
-		leaf.keyMutexes[pos].Lock()
-		leaf.mutex.Unlock() // 释放节点锁，允许其他键的操作继续
-		defer leaf.keyMutexes[pos].Unlock()
-
 		// 如果是唯一索引，返回错误
 		if unique {
 			return fmt.Errorf("unique index violation: key '%s' already exists", key)
 		}
-		// 否则，添加记录ID
+		
+		// 检查记录ID是否已存在
+		for _, existingID := range leaf.Values[pos] {
+			if existingID == recordID {
+				// 记录ID已存在，无需重复添加
+				return nil
+			}
+		}
+		
+		// 添加记录ID
 		leaf.Values[pos] = append(leaf.Values[pos], recordID)
 		return nil
 	}
-
-	// 需要修改节点结构，保持节点锁
-	defer leaf.mutex.Unlock()
 
 	// 插入新键值对
 	leaf.Keys = append(leaf.Keys, "")
@@ -60,7 +62,6 @@ func (bt *BTree) Insert(key string, recordID string, unique bool) error {
 	if pos < len(leaf.Keys)-1 {
 		copy(leaf.Keys[pos+1:], leaf.Keys[pos:len(leaf.Keys)-1])
 		copy(leaf.Values[pos+1:], leaf.Values[pos:len(leaf.Values)-1])
-		// 不需要移动互斥锁，它们是值类型
 	}
 
 	// 插入新键值对

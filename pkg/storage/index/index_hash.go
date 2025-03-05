@@ -232,3 +232,110 @@ func (idx *HashIndex) Delete(key string, value string) error {
 				idx.mutex.Unlock()
 				
 				// 更新
+```
+## 5. 优化哈希索引的扩容操作
+```go
+// resize 重新调整哈希表大小
+func (idx *HashIndex) resize(newSize int) {
+    startTime := time.Now()
+    
+    // 获取全局锁
+    idx.mutex.Lock()
+    defer idx.mutex.Unlock()
+    
+    // 检查是否已经被其他线程调整过大小
+    if idx.size >= newSize {
+        return
+    }
+    
+    log.Printf("哈希索引开始扩容: %d -> %d", idx.size, newSize)
+    
+    // 创建新的桶数组
+    newBuckets := make([]bucket, newSize)
+    for i := range newBuckets {
+        newBuckets[i] = bucket{entries: make([]entry, 0, 4)}
+    }
+    
+    // 创建新的分片锁
+    newBucketMutex := make([]sync.RWMutex, newSize)
+    
+    // 重新哈希所有条目
+    for i := range idx.buckets {
+        for _, e := range idx.buckets[i].entries {
+            // 计算新的桶索引
+            newBucketIdx := int(idx.hash(e.key) % uint32(newSize))
+            
+            // 添加到新桶
+            newBuckets[newBucketIdx].entries = append(
+                newBuckets[newBucketIdx].entries, e)
+        }
+    }
+    
+    // 更新索引状态
+    idx.buckets = newBuckets
+    idx.bucketMutex = newBucketMutex
+    idx.size = newSize
+    
+    // 更新统计信息
+    if idx.stats != nil {
+        idx.stats.mutex.Lock()
+        idx.stats.Resizes++
+        idx.stats.LastResizeTime = time.Since(startTime)
+        idx.stats.mutex.Unlock()
+    }
+    
+    log.Printf("哈希索引扩容完成，耗时: %v", time.Since(startTime))
+}
+
+// optimizeBuckets 优化桶分布
+func (idx *HashIndex) optimizeBuckets() {
+    // 获取全局锁
+    idx.mutex.RLock()
+    
+    // 计算桶的使用情况
+    bucketStats := make([]int, idx.size)
+    for i := range idx.buckets {
+        bucketStats[i] = len(idx.buckets[i].entries)
+    }
+    idx.mutex.RUnlock()
+    
+    // 计算平均每个桶的条目数
+    var total, max, empty int
+    for _, count := range bucketStats {
+        total += count
+        if count > max {
+            max = count
+        }
+        if count == 0 {
+            empty++
+        }
+    }
+    avg := float64(total) / float64(idx.size)
+    
+    // 计算标准差
+    var variance float64
+    for _, count := range bucketStats {
+        diff := float64(count) - avg
+        variance += diff * diff
+    }
+    stdDev := math.Sqrt(variance / float64(idx.size))
+    
+    // 记录统计信息
+    if idx.stats != nil {
+        idx.stats.mutex.Lock()
+        idx.stats.AvgBucketSize = avg
+        idx.stats.MaxBucketSize = max
+        idx.stats.EmptyBuckets = empty
+        idx.stats.BucketStdDev = stdDev
+        idx.stats.mutex.Unlock()
+    }
+    
+    // 如果标准差过大，考虑重新哈希
+    if stdDev > avg*2 && idx.count > 1000 {
+        log.Printf("哈希索引桶分布不均，考虑重新哈希: 平均=%v, 最大=%v, 空桶=%v, 标准差=%v",
+            avg, max, empty, stdDev)
+        
+        // 异步执行重新哈希
+        go idx.resize(idx.size)
+    }
+}

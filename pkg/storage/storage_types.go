@@ -17,6 +17,7 @@ var (
 )
 
 // DB 表示一个简单的键值存储数据库
+// 在DB结构体中添加以下字段
 type DB struct {
 	path          string                     // 数据库文件路径
 	isOpen        bool                       // 数据库是否打开
@@ -53,6 +54,10 @@ type DB struct {
 	lastFlushTime  time.Time     // 最后一次刷新时间
 	lastBackupTime time.Time     // 最后一次备份时间
 	startTime      time.Time     // 数据库启动时间
+    modificationTimes map[string]time.Time  // 键的最后修改时间
+    lastBackupTime    time.Time             // 最后备份时间
+    backupTicker      *time.Ticker          // 定期备份计时器
+    backupKeepCount   int                   // 保留的备份数量
 }
 
 // writeOp 表示一个写操作

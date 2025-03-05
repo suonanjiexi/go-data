@@ -6,48 +6,53 @@ import (
 
 // Delete 从B+树中删除键
 func (bt *BTree) Delete(key string) bool {
-	bt.mutex.Lock()
-	defer bt.mutex.Unlock()
+    bt.mutex.Lock()
+    
+    // 查找叶子节点
+    leaf := bt.findLeaf(key)
+    
+    // 释放树锁，只保留叶子节点锁
+    bt.mutex.Unlock()
+    
+    // 获取节点写锁
+    leaf.mutex.Lock()
+    defer leaf.mutex.Unlock()
 
-	// 查找叶子节点
-	leaf := bt.findLeaf(key)
-	
-	// 获取节点写锁
-	leaf.mutex.Lock()
-	defer leaf.mutex.Unlock()
+    // 在叶子节点中查找键
+    deletePos := -1
+    for i, k := range leaf.Keys {
+        if k == key {
+            deletePos = i
+            break
+        }
+    }
 
-	// 在叶子节点中查找键
-	deletePos := -1
-	for i, k := range leaf.Keys {
-		if k == key {
-			deletePos = i
-			break
-		}
-	}
+    // 如果键不存在，返回false
+    if deletePos == -1 {
+        return false
+    }
 
-	// 如果键不存在，返回false
-	if deletePos == -1 {
-		return false
-	}
+    // 删除键值对
+    leaf.Keys = append(leaf.Keys[:deletePos], leaf.Keys[deletePos+1:]...)
+    leaf.Values = append(leaf.Values[:deletePos], leaf.Values[deletePos+1:]...)
+    leaf.keyMutexes = append(leaf.keyMutexes[:deletePos], leaf.keyMutexes[deletePos+1:]...)
 
-	// 删除键值对
-	leaf.Keys = append(leaf.Keys[:deletePos], leaf.Keys[deletePos+1:]...)
-	leaf.Values = append(leaf.Values[:deletePos], leaf.Values[deletePos+1:]...)
-	leaf.keyMutexes = append(leaf.keyMutexes[:deletePos], leaf.keyMutexes[deletePos+1:]...)
+    // 更新统计信息
+    if bt.Stats != nil {
+        bt.Stats.mutex.Lock()
+        bt.Stats.Deletes++
+        bt.Stats.mutex.Unlock()
+    }
 
-	// 更新统计信息
-	if bt.Stats != nil {
-		bt.Stats.mutex.Lock()
-		bt.Stats.Deletes++
-		bt.Stats.mutex.Unlock()
-	}
+    // 检查是否需要合并或重新分配
+    if len(leaf.Keys) < bt.Degree && leaf != bt.Root {
+        // 需要获取树锁进行合并操作
+        bt.mutex.Lock()
+        bt.handleUnderflow(leaf)
+        bt.mutex.Unlock()
+    }
 
-	// 检查是否需要合并或重新分配
-	if len(leaf.Keys) < bt.Degree && leaf != bt.Root {
-		bt.handleUnderflow(leaf)
-	}
-
-	return true
+    return true
 }
 
 // handleUnderflow 处理节点下溢
