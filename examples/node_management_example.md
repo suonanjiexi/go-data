@@ -165,7 +165,38 @@ func handleNodeRecovery(nodeID string) error {
    - 平滑扩容和缩容
    - 负载均衡策略
 
+### 3. 集群健康检查
+
+```go
+// 获取集群健康状态
+resp, err := http.Get("http://localhost:8080/api/cluster/status")
+if err == nil {
+    defer resp.Body.Close()
+    var status map[string]interface{}
+    json.NewDecoder(resp.Body).Decode(&status)
+    fmt.Printf("集群状态: %s\n健康节点数: %d\n总分片数: %d\n", 
+        status["status"], status["healthyNodes"], status["totalShards"])
+}
+
+// 更新心跳间隔配置
+params := map[string]interface{}{"heartbeatInterval": 5}
+body, _ := json.Marshal(params)
+req, _ := http.NewRequest("POST", "http://localhost:8080/api/cluster/parameters", bytes.NewBuffer(body))
+client := &http.Client{}
+resp, err = client.Do(req)
+if err == nil {
+    defer resp.Body.Close()
+    fmt.Println("配置更新成功")
+}
+```
+
 ## 注意事项
+
+3. 推荐配置参数：
+   - 心跳间隔：5秒
+   - 故障转移阈值：3次失败
+   - 节点健康检查超时：15秒
+   - 最大网络延迟：200ms
 
 1. 确保节点之间的网络连接稳定
 2. 合理设置心跳超时时间
