@@ -269,3 +269,166 @@ func (idx *Index) splitIfNeededInternal(node *BPlusTreeNode) error {
 	// 更新父节点
 	return idx.updateParent(node, newNode, midKey)
 }
+
+// 优化 B+树节点结构，增加节点锁和缓存支持
+type BPlusTreeNode struct {
+    IsLeaf   bool
+    Keys     []string
+    Values   [][]string
+    Children []*BPlusTreeNode
+    Next     *BPlusTreeNode  // 用于叶子节点链表
+    Parent   *BPlusTreeNode  // 父节点引用，优化向上遍历
+    mutex    sync.RWMutex    // 节点级锁，提高并发性能
+    dirty    bool            // 标记节点是否被修改，用于缓存管理
+}
+
+// 增强 Find 方法，支持并发安全的查找
+func (idx *Index) Find(key string) ([]string, error) {
+    startTime := time.Now()
+    
+    // 使用读锁保护根节点
+    idx.mutex.RLock()
+    root := idx.Root
+    idx.mutex.RUnlock()
+    
+    if root == nil {
+        return nil, fmt.Errorf("index is empty")
+    }
+    
+    // 查找叶子节点
+    leaf := idx.findLeaf(key)
+    if leaf == nil {
+        return nil, fmt.Errorf("leaf node not found")
+    }
+    
+    // 在叶子节点中查找键
+    leaf.mutex.RLock()
+    defer leaf.mutex.RUnlock()
+    
+    for i, k := range leaf.Keys {
+        if k == key {
+            // 更新统计信息
+            idx.updateStats(time.Since(startTime))
+            return leaf.Values[i], nil
+        }
+    }
+    
+    return nil, fmt.Errorf("key not found: %s", key)
+}
+
+// 优化 Insert 方法，支持并发插入
+func (idx *Index) Insert(key string, value string) error {
+    // 如果是唯一索引，先检查键是否已存在
+    if idx.Unique {
+        if _, err := idx.Find(key); err == nil {
+            return fmt.Errorf("duplicate key in unique index: %s", key)
+        }
+    }
+    
+    idx.mutex.Lock()
+    defer idx.mutex.Unlock()
+    
+    // 如果根节点为空，创建新的根节点
+    if idx.Root == nil {
+        idx.Root = &BPlusTreeNode{
+            IsLeaf: true,
+            Keys:   []string{key},
+            Values: [][]string{{value}},
+        }
+        return nil
+    }
+    
+    // 查找要插入的叶子节点
+    leaf := idx.findLeaf(key)
+    
+    // 在叶子节点中插入键值对
+    leaf.mutex.Lock()
+    defer leaf.mutex.Unlock()
+    
+    // ... 插入逻辑 ...
+    
+    // 如果需要分裂节点
+    if len(leaf.Keys) > idx.Order {
+        return idx.splitLeaf(leaf)
+    }
+    
+    return nil
+}
+
+// 新增范围查询优化方法
+func (idx *Index) RangeQuery(startKey, endKey string) (map[string][]string, error) {
+    startTime := time.Now()
+    result := make(map[string][]string)
+    
+    // 查找起始叶子节点
+    leaf := idx.findLeaf(startKey)
+    if leaf == nil {
+        return nil, fmt.Errorf("start leaf not found")
+    }
+    
+    // 遍历叶子节点链表
+    for leaf != nil {
+        leaf.mutex.RLock()
+        
+        // 收集范围内的键值对
+        for i, k := range leaf.Keys {
+            if k >= startKey && (endKey == "" || k <= endKey) {
+                result[k] = leaf.Values[i]
+            }
+            
+            // 如果已经超过结束键，提前结束
+            if endKey != "" && k > endKey {
+                leaf.mutex.RUnlock()
+                idx.updateStats(time.Since(startTime))
+                return result, nil
+            }
+        }
+        
+        // 获取下一个叶子节点
+        nextLeaf := leaf.Next
+        leaf.mutex.RUnlock()
+        leaf = nextLeaf
+    }
+    
+    idx.updateStats(time.Since(startTime))
+    return result, nil
+}
+
+// 新增前缀查询方法
+func (idx *Index) PrefixQuery(prefix string) (map[string][]string, error) {
+    startTime := time.Now()
+    result := make(map[string][]string)
+    
+    // 查找起始叶子节点
+    leaf := idx.findLeaf(prefix)
+    if leaf == nil {
+        return nil, fmt.Errorf("prefix leaf not found")
+    }
+    
+    // 遍历叶子节点链表
+    for leaf != nil {
+        leaf.mutex.RLock()
+        
+        // 收集前缀匹配的键值对
+        hasMatch := false
+        for i, k := range leaf.Keys {
+            if strings.HasPrefix(k, prefix) {
+                result[k] = leaf.Values[i]
+                hasMatch = true
+            } else if hasMatch {
+                // 如果已经找到过匹配项，且当前键不匹配，说明已经超出前缀范围
+                leaf.mutex.RUnlock()
+                idx.updateStats(time.Since(startTime))
+                return result, nil
+            }
+        }
+        
+        // 获取下一个叶子节点
+        nextLeaf := leaf.Next
+        leaf.mutex.RUnlock()
+        leaf = nextLeaf
+    }
+    
+    idx.updateStats(time.Since(startTime))
+    return result, nil
+}

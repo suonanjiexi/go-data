@@ -9,39 +9,39 @@ import (
 
 // Commit 提交事务
 func (tx *Transaction) Commit() error {
-	tx.mutex.Lock()
-	defer tx.mutex.Unlock()
+    tx.mutex.Lock()
+    defer tx.mutex.Unlock()
 
-	// 检查事务状态
-	if tx.status != TxStatusActive {
-		return ErrTxNotActive
-	}
+    // 检查事务状态
+    if tx.status != TxStatusActive {
+        return ErrTxNotActive
+    }
 
-	// 检查事务是否超时
-	if time.Since(tx.startTime) > tx.timeout {
-		tx.status = TxStatusAborted
-		return ErrTxTimeout
-	}
+    // 检查事务是否超时
+    if time.Since(tx.startTime) > tx.timeout {
+        tx.status = TxStatusAborted
+        return ErrTxTimeout
+    }
 
-	// 将写集合应用到数据库
-	for key, value := range tx.writeSet {
-		if value == nil {
-			// 删除操作
-			if err := tx.db.Delete(key); err != nil {
-				tx.status = TxStatusAborted
-				return err
-			}
-		} else {
-			// 写入操作
-			if err := tx.db.Put(key, value); err != nil {
-				tx.status = TxStatusAborted
-				return err
-			}
-		}
-	}
+    // 将写集合应用到数据库
+    for key, value := range tx.writeSet {
+        var err error
+        if value == nil {
+            // 删除操作
+            err = tx.db.Delete(key)
+        } else {
+            // 写入操作
+            err = tx.db.Put(key, value)
+        }
+        
+        if err != nil {
+            tx.status = TxStatusAborted
+            return fmt.Errorf("提交事务失败: %w", err)
+        }
+    }
 
-	tx.status = TxStatusCommitted
-	return nil
+    tx.status = TxStatusCommitted
+    return nil
 }
 
 // Rollback 回滚事务
