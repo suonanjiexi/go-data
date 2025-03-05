@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/suonanjiexi/cyber-db/pkg/parser"
@@ -19,32 +20,58 @@ import (
 
 // Server 表示数据库服务器
 type Server struct {
-	host      string
-	port      int
-	db        *storage.DB
-	txManager *transaction.Manager
-	parser    *parser.Parser
-	listener  net.Listener
-	mutex     sync.RWMutex
-	running   bool
-	conns     map[string]net.Conn // 跟踪活跃连接
-	connMutex sync.Mutex          // 连接映射的互斥锁
-	charset   string              // 字符集编码
+	host           string
+	port           int
+	db             *storage.DB
+	txManager      *transaction.Manager
+	parser         *parser.Parser
+	listener       net.Listener
+	mutex          sync.RWMutex
+	running        bool
+	conns          map[string]net.Conn // 跟踪活跃连接
+	connMutex      sync.Mutex          // 连接映射的互斥锁
+	charset        string              // 字符集编码
+	connTimeout    time.Duration       // 连接超时时间
+	queryTimeout   time.Duration       // 查询超时时间
+	maxConnections int                 // 最大连接数
+	activeQueries  int32               // 当前活跃查询数
+	metrics        map[string]int64    // 性能指标统计
+	metricsMutex   sync.Mutex          // 指标互斥锁
 }
 
 // NewServer 创建一个新的数据库服务器
 func NewServer(host string, port int, db *storage.DB) *Server {
 	txManager := transaction.NewManager(db, 30*time.Second) // 默认30秒超时
 	return &Server{
-		host:      host,
-		port:      port,
-		db:        db,
-		txManager: txManager,
-		parser:    parser.NewParser(),
-		running:   false,
-		conns:     make(map[string]net.Conn),
-		charset:   "utf8mb4", // 默认使用utf8mb4字符集
+		host:           host,
+		port:           port,
+		db:             db,
+		txManager:      txManager,
+		parser:         parser.NewParser(),
+		running:        false,
+		conns:          make(map[string]net.Conn),
+		charset:        "utf8mb4",        // 默认使用utf8mb4字符集
+		connTimeout:    5 * time.Minute,  // 默认连接超时时间
+		queryTimeout:   30 * time.Second, // 默认查询超时时间
+		maxConnections: 100,              // 默认最大连接数
+		activeQueries:  0,
+		metrics:        make(map[string]int64),
 	}
+}
+
+// SetConnTimeout 设置连接超时时间
+func (s *Server) SetConnTimeout(timeout time.Duration) {
+	s.connTimeout = timeout
+}
+
+// SetQueryTimeout 设置查询超时时间
+func (s *Server) SetQueryTimeout(timeout time.Duration) {
+	s.queryTimeout = timeout
+}
+
+// SetMaxConnections 设置最大连接数
+func (s *Server) SetMaxConnections(max int) {
+	s.maxConnections = max
 }
 
 // Start 启动服务器
@@ -141,10 +168,20 @@ func (s *Server) acceptConnections() {
 func (s *Server) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
-	log.Printf("New connection from %s\n", conn.RemoteAddr())
+	// 检查连接数是否超过最大限制
+	s.connMutex.Lock()
+	connCount := len(s.conns)
+	s.connMutex.Unlock()
+	if connCount >= s.maxConnections {
+		log.Printf("Connection limit reached (%d), rejecting connection from %s\n", s.maxConnections, conn.RemoteAddr())
+		fmt.Fprintf(conn, "Error: Server connection limit reached. Please try again later.\n")
+		return
+	}
+
+	log.Printf("New connection from %s (active connections: %d/%d)\n", conn.RemoteAddr(), connCount+1, s.maxConnections)
 
 	// 设置连接超时
-	conn.SetDeadline(time.Now().Add(5 * time.Minute))
+	conn.SetDeadline(time.Now().Add(s.connTimeout))
 
 	// 发送欢迎消息
 	fmt.Fprintf(conn, "Welcome to Cyber-DB Database (Charset: %s)\n", s.charset)
@@ -153,22 +190,23 @@ func (s *Server) handleConnection(conn net.Conn) {
 	// 创建一个事务
 	tx, err := s.txManager.Begin()
 	if err != nil {
+		log.Printf("Error creating transaction for connection %s: %v\n", conn.RemoteAddr(), err)
 		fmt.Fprintf(conn, "Error: %v\n", err)
 		return
 	}
 
 	// 创建一个上下文，用于处理超时
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), s.connTimeout)
 	defer cancel()
 
 	scanner := bufio.NewScanner(conn)
 	for scanner.Scan() {
 		// 重置连接超时
-		conn.SetDeadline(time.Now().Add(5 * time.Minute))
+		conn.SetDeadline(time.Now().Add(s.connTimeout))
 
 		// 重置查询超时上下文
 		cancel()
-		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+		ctx, cancel = context.WithTimeout(context.Background(), s.queryTimeout)
 
 		cmd := scanner.Text()
 		cmd = strings.TrimSpace(cmd)
@@ -257,6 +295,10 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 	// 记录开始时间，用于计算查询耗时
 	startTime := time.Now()
 
+	// 更新活跃查询计数
+	atomic.AddInt32(&s.activeQueries, 1)
+	defer atomic.AddInt32(&s.activeQueries, -1)
+
 	// 检查事务状态和超时
 	txStatus := tx.Status()
 	if txStatus != transaction.TxStatusActive {
@@ -267,20 +309,29 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 	var result string
 	var err error
 
+	// 记录查询类型
+	queryType := "unknown"
 	switch stmt.Type {
 	case parser.InsertStmt:
+		queryType = "insert"
 		result, err = s.executeInsert(stmt, tx)
 	case parser.SelectStmt:
+		queryType = "select"
 		result, err = s.executeSelect(stmt, tx)
 	case parser.UpdateStmt:
+		queryType = "update"
 		result, err = s.executeUpdate(stmt, tx)
 	case parser.DeleteStmt:
+		queryType = "delete"
 		result, err = s.executeDelete(stmt, tx)
 	case parser.CreateTableStmt:
+		queryType = "create_table"
 		result, err = s.executeCreateTable(stmt, tx)
 	case parser.CreateIndexStmt:
+		queryType = "create_index"
 		result, err = s.executeCreateIndex(stmt, tx)
 	case parser.DropIndexStmt:
+		queryType = "drop_index"
 		result, err = s.executeDropIndex(stmt, tx)
 	default:
 		err = fmt.Errorf("unsupported statement type: %v", stmt.Type)
@@ -289,26 +340,66 @@ func (s *Server) executeStatement(stmt *parser.Statement, tx *transaction.Transa
 	// 再次检查事务状态，确保事务在执行过程中没有超时
 	txStatus = tx.Status()
 	if txStatus != transaction.TxStatusActive {
+		// 更新事务超时计数
+		s.updateMetric("tx_timeout_count", 1)
 		return "", fmt.Errorf("transaction became inactive during execution")
 	}
 
 	// 处理执行错误
 	if err != nil {
+		// 更新错误计数
+		s.updateMetric("query_error_count", 1)
+		s.updateMetric(fmt.Sprintf("%s_error_count", queryType), 1)
+
 		// 回滚事务并返回错误
 		rollbackErr := tx.Rollback()
 		if rollbackErr != nil {
 			// 如果回滚也失败，记录错误并返回组合错误信息
 			log.Printf("Error rolling back transaction: %v\n", rollbackErr)
+			s.updateMetric("rollback_error_count", 1)
 			return "", fmt.Errorf("execution failed: %v; rollback failed: %v", err, rollbackErr)
 		}
 		return "", fmt.Errorf("execution failed: %v", err)
 	}
 
-	// 计算查询耗时并添加到结果中
+	// 计算查询耗时
 	elapsedTime := time.Since(startTime)
+	elapsedMs := elapsedTime.Milliseconds()
+
+	// 更新性能指标
+	s.updateMetric("query_count", 1)
+	s.updateMetric(fmt.Sprintf("%s_count", queryType), 1)
+	s.updateMetric("query_time_total_ms", elapsedMs)
+
+	// 添加查询耗时到结果中
 	result = fmt.Sprintf("%s\n查询耗时: %v", result, elapsedTime.Round(time.Millisecond))
 
 	return result, nil
+}
+
+// updateMetric 更新性能指标
+func (s *Server) updateMetric(name string, value int64) {
+	s.metricsMutex.Lock()
+	defer s.metricsMutex.Unlock()
+
+	s.metrics[name] += value
+}
+
+// GetMetrics 获取所有性能指标
+func (s *Server) GetMetrics() map[string]int64 {
+	s.metricsMutex.Lock()
+	defer s.metricsMutex.Unlock()
+
+	// 创建指标的副本
+	result := make(map[string]int64, len(s.metrics))
+	for k, v := range s.metrics {
+		result[k] = v
+	}
+
+	// 添加当前活跃查询数
+	result["active_queries"] = int64(atomic.LoadInt32(&s.activeQueries))
+
+	return result
 }
 
 // executeSelect 执行SELECT语句
@@ -381,11 +472,10 @@ func (s *Server) executeSelect(stmt *parser.Statement, tx *transaction.Transacti
 			// 查找可用的索引
 			for _, col := range stmt.Columns {
 				// 这里简化处理，实际应该根据查询条件选择最优索引
-				indexName := fmt.Sprintf("%s_%s_idx", stmt.Table, col)
-				index, err := indexManager.GetIndex(stmt.Table, indexName)
-				if index != nil || err == nil {
+				index := indexManager.GetTableIndex(stmt.Table, col)
+				if index != nil {
 					// 使用索引查询
-					results = append(results, fmt.Sprintf("Using index: %s", indexName))
+					results = append(results, fmt.Sprintf("Using index: %s", index.Config.Name))
 					break
 				}
 			}
